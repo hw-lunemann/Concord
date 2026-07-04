@@ -3,6 +3,7 @@ use std::net::TcpStream;
 use serde::{de::DeserializeOwned, Serialize};
 
 type User = String;
+const server_port: i32 = 15555;
 
 #[derive(Serialize, Deserialize, Debug)]
 enum ClientCommand {
