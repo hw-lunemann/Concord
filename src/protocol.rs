@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::io::prelude::*;
+use std::io::{Error, ErrorKind, prelude::*};
 use std::net::TcpStream;
 
 pub const server_port: i32 = 15555;
@@ -56,10 +56,30 @@ pub fn send<M: Serialize>(stream: &mut TcpStream, message: &M) -> std::io::Resul
 
 pub fn receive<M: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<M> {
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
+    let peek_len = stream.peek(&mut len_buf)?;
+    if peek_len < 4 {
+        return Err(Error::new(
+            ErrorKind::WouldBlock,
+            "Can't receive a whole package yet",
+        ));
+    }
 
+    let data_len = u32::from_be_bytes(len_buf) as usize;
+
+    let peek_len = stream.peek(&mut len_buf)?;
+    if peek_len < data_len + 4 {
+        return Err(Error::new(
+            ErrorKind::WouldBlock,
+            "Can't receive a whole package yet",
+        ));
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
     let mut buf = vec![0; len];
+
+    // now everything can be read if the os buffer is large enough
+    // consume first four bytes properly before reading Message
+    stream.read_exact(&mut len_buf)?;
     stream.read_exact(&mut buf)?;
 
     let msg = serde_json::from_slice(&buf)
