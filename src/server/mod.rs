@@ -85,7 +85,7 @@ impl Server {
         loop {
             while let Ok((stream, remote_addr)) = listener.accept() {
                 if stream.set_nonblocking(false).is_ok() {
-                    unauthenticated_connections.push(stream);
+                    unauthenticated_connections.push((stream, remote_addr));
                     println!("Connection from Client {} accepted", remote_addr);
                 } else {
                     let _ = stream.shutdown(Shutdown::Both);
@@ -97,27 +97,51 @@ impl Server {
             }
 
             let mut remaining_unauthenticated_connections = Vec::new();
-            for (index, mut stream) in unauthenticated_connections.into_iter().enumerate() {
+            for (mut stream, remote_addr) in unauthenticated_connections.into_iter() {
                 match protocol::receive::<ClientCommand>(&mut stream) {
-                    Ok(command) => if let Err(msg) = self.handle_client_login(stream, command) {},
+                    Ok(command) => match self.handle_client_login(stream, command) {
+                        Err(msg) => {
+                            println!(
+                                "First command from new connection with {} is not a login: {:?}",
+                                remote_addr, msg
+                            );
+                        }
+                        Ok(client_id) => {
+                            println!(
+                                "Login from {} with username {}",
+                                remote_addr, self.clients.user_name[client_id]
+                            );
+                        }
+                    },
                     Err(e) => {
                         if e.kind() != ErrorKind::WouldBlock {
                             let _ = stream.shutdown(Shutdown::Both);
                             println!("Receive failed, dropped connection: {}", e);
                         } else {
-                            remaining_unauthenticated_connections.push(stream);
+                            remaining_unauthenticated_connections.push((stream, remote_addr));
                         }
                     }
                 }
             }
             unauthenticated_connections = remaining_unauthenticated_connections;
 
-            for &client in &self.clients.active {
-                let stream = self.clients.stream[client]
-                    .as_mut()
-                    .expect("active client has None stream");
-                if let Err(e) = protocol::receive::<ClientCommand>(stream) {
-                    //
+            for client in self.clients.active.clone() {
+                let result = {
+                    let stream = self.clients.stream[client]
+                        .as_mut()
+                        .expect("active client has None stream");
+
+                    protocol::receive::<ClientCommand>(stream)
+                };
+
+                match result {
+                    Ok(command) => self.handle_client_command(client, command),
+                    Err(e) => {
+                        if e.kind() != ErrorKind::WouldBlock {
+                            self.clients.logout(client);
+                            println!("Receive failed, dropped connection: {}", e);
+                        }
+                    }
                 }
             }
         }
