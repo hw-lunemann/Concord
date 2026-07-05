@@ -1,8 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
-    net::{Shutdown, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
 };
+
+use std::io::ErrorKind;
 
 use crate::protocol::{self, ClientCommand, ServerCommand};
 
@@ -30,7 +32,7 @@ impl Clients {
         self.public_key.len()
     }
 
-    fn login(&mut self, public_key: PublicKey, user_name: String, stream: TcpStream) {
+    fn login(&mut self, public_key: PublicKey, user_name: String, stream: TcpStream) -> ClientId {
         let id = if let Some(&old_id) = self.id_by_public_key.get(&public_key) {
             self.user_name[old_id] = user_name;
             self.stream[old_id] = Some(stream);
@@ -49,12 +51,13 @@ impl Clients {
 
         // mark active in any case.
         self.active.insert(id);
+        return id;
     }
 
     fn logout(&mut self, id: ClientId) {
         if let Some(stream) = &self.stream[id] {
             if let Err(e) = stream.shutdown(Shutdown::Both) {
-                println!("Failed TcpStream::shutdown with: {:?}", e);
+                println!("Failed TcpStream::shutdown on logout with: {:?}", e);
             }
         }
         self.stream[id] = None;
@@ -62,25 +65,76 @@ impl Clients {
     }
 }
 
-struct Server {
+pub struct Server {
     clients: Clients,
 }
 
 impl Server {
-    fn new() -> Server {
+    pub fn new() -> Server {
         Server {
             clients: Clients::init(),
         }
     }
 
-    fn handle_client_login(&mut self, stream: TcpStream, login: ClientCommand) {
+    pub fn run(mut self) -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:80")?;
+        listener.set_nonblocking(true)?;
+
+        let mut unauthenticated_connections = Vec::new();
+
+        loop {
+            while let Ok((stream, remote_addr)) = listener.accept() {
+                if stream.set_nonblocking(false).is_ok() {
+                    unauthenticated_connections.push(stream);
+                    println!("Connection from Client {} accepted", remote_addr);
+                } else {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    println!(
+                        "Connection from Client {} couldn't be set to nonblocking and was dropped.",
+                        remote_addr
+                    )
+                };
+            }
+
+            let mut remaining_unauthenticated_connections = Vec::new();
+            for (index, mut stream) in unauthenticated_connections.into_iter().enumerate() {
+                match protocol::receive::<ClientCommand>(&mut stream) {
+                    Ok(command) => if let Err(msg) = self.handle_client_login(stream, command) {},
+                    Err(e) => {
+                        if e.kind() != ErrorKind::WouldBlock {
+                            let _ = stream.shutdown(Shutdown::Both);
+                            println!("Receive failed, dropped connection: {}", e);
+                        } else {
+                            remaining_unauthenticated_connections.push(stream);
+                        }
+                    }
+                }
+            }
+            unauthenticated_connections = remaining_unauthenticated_connections;
+
+            for &client in &self.clients.active {
+                let stream = self.clients.stream[client]
+                    .as_mut()
+                    .expect("active client has None stream");
+                if let Err(e) = protocol::receive::<ClientCommand>(stream) {
+                    //
+                }
+            }
+        }
+    }
+
+    fn handle_client_login(
+        &mut self,
+        stream: TcpStream,
+        login: ClientCommand,
+    ) -> std::result::Result<ClientId, String> {
         if let ClientCommand::LogIn(user_name, public_key) = login {
-            self.clients.login(public_key, user_name, stream);
+            Ok(self.clients.login(public_key, user_name, stream))
         } else {
-            println!(
-                "BUG: called login handler with wrong ClientCommand variant: {:?}",
+            Err(format!(
+                "called login handler with wrong ClientCommand variant: {:?}",
                 login
-            );
+            ))
         }
     }
 
