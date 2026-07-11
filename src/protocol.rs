@@ -1,14 +1,21 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::io::{Error, ErrorKind, prelude::*};
+use std::io::prelude::*;
 use std::net::TcpStream;
 
-pub const server_port: i32 = 15555;
+pub const SERVER_PORT: u16 = 15555;
 pub type User = String;
+pub type PublicKey = String;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LoginCommand {
+    pub user_name: String,
+    pub public_key: PublicKey,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientCommand {
     // Username, Public Key
-    LogIn(String, String),
+    Logout(),
     // Message vom client zum server
     SendMessage(String),
     // TODO
@@ -17,29 +24,14 @@ pub enum ClientCommand {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum ServerResponse {
-    // Okay
-    Ack(ClientCommand),
-    // Command, Reason for error
-    Error(ClientCommand, String),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 pub enum ServerCommand {
     // Message vom server zum client
-    SendMessage(String),
+    // timestamp secs, user name, content
+    SendMessage(u64, String, String),
     // Connect new user
     UserConnected(User),
     // Disconnect user
     UserDisconnected(User),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum ClientResponse {
-    // Okay
-    Ack(ServerCommand),
-    // Command, Reason for error
-    Error(ServerCommand, String),
 }
 
 pub fn send<M: Serialize>(stream: &mut TcpStream, message: &M) -> std::io::Result<()> {
@@ -56,30 +48,10 @@ pub fn send<M: Serialize>(stream: &mut TcpStream, message: &M) -> std::io::Resul
 
 pub fn receive<M: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<M> {
     let mut len_buf = [0u8; 4];
-    let peek_len = stream.peek(&mut len_buf)?;
-    if peek_len < 4 {
-        return Err(Error::new(
-            ErrorKind::WouldBlock,
-            "Can't receive a whole package yet",
-        ));
-    }
-
+    stream.read_exact(&mut len_buf)?;
     let data_len = u32::from_be_bytes(len_buf) as usize;
 
-    let peek_len = stream.peek(&mut len_buf)?;
-    if peek_len < data_len + 4 {
-        return Err(Error::new(
-            ErrorKind::WouldBlock,
-            "Can't receive a whole package yet",
-        ));
-    }
-
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0; len];
-
-    // now everything can be read if the os buffer is large enough
-    // consume first four bytes properly before reading Message
-    stream.read_exact(&mut len_buf)?;
+    let mut buf = vec![0; data_len];
     stream.read_exact(&mut buf)?;
 
     let msg = serde_json::from_slice(&buf)
