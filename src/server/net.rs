@@ -1,13 +1,13 @@
-use std::{borrow::Borrow, net::SocketAddr, sync::Arc};
+use std::{borrow::Borrow, marker::PhantomData, net::SocketAddr};
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{mpsc, oneshot},
 };
 
-use crate::protocol::{ClientCommand, LoginCommand, ServerCommand, User};
+use crate::protocol::{ClientCommand, LoginCommand, ServerCommand};
 
 pub struct TcpConnection {
     pub stream: TcpStream,
@@ -15,7 +15,7 @@ pub struct TcpConnection {
 }
 
 impl TcpConnection {
-    pub fn init(conn: (TcpStream, SocketAddr)) -> TcpConnectionHandle {
+    pub fn init(conn: (TcpStream, SocketAddr)) -> TcpConnectionHandle<Handshake> {
         println!("New connection from: {}", conn.1);
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
@@ -27,7 +27,10 @@ impl TcpConnection {
             .await
         });
 
-        TcpConnectionHandle { inner: tx }
+        TcpConnectionHandle {
+            state: PhantomData,
+            inner: tx,
+        }
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<TcpConnectionMessage>) {
@@ -75,12 +78,43 @@ impl TcpConnection {
     }
 }
 
-#[derive(Clone)]
-pub struct TcpConnectionHandle {
+// connection states
+pub struct Handshake;
+pub struct Authenticated;
+
+pub struct TcpConnectionHandle<State> {
     inner: mpsc::Sender<TcpConnectionMessage>,
+    state: PhantomData<State>,
 }
 
-impl TcpConnectionHandle {
+impl<State> Clone for TcpConnectionHandle<State> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            state: PhantomData,
+        }
+    }
+}
+
+impl TcpConnectionHandle<Handshake> {
+    pub async fn receive_login(&self) -> std::io::Result<LoginCommand> {
+        let (respond_to, response) = oneshot::channel();
+        let _ = self
+            .inner
+            .send(TcpConnectionMessage::Login(respond_to))
+            .await;
+        response.await.expect("TcpConnection task died.")
+    }
+
+    pub fn authenticate(self) -> TcpConnectionHandle<Authenticated> {
+        TcpConnectionHandle::<Authenticated> {
+            inner: self.inner,
+            state: PhantomData,
+        }
+    }
+}
+
+impl TcpConnectionHandle<Authenticated> {
     pub async fn send<C>(&self, command: C) -> std::io::Result<()>
     where
         C: Borrow<ServerCommand>,
@@ -103,15 +137,6 @@ impl TcpConnectionHandle {
         let _ = self
             .inner
             .send(TcpConnectionMessage::Receive(respond_to))
-            .await;
-        response.await.expect("TcpConnection task died.")
-    }
-
-    pub async fn receive_login(&self) -> std::io::Result<LoginCommand> {
-        let (respond_to, response) = oneshot::channel();
-        let _ = self
-            .inner
-            .send(TcpConnectionMessage::Login(respond_to))
             .await;
         response.await.expect("TcpConnection task died.")
     }

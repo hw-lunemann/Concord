@@ -13,13 +13,13 @@ use crate::{
     protocol::{self, ClientCommand, ServerCommand},
     server::{
         clients::{ClientId, Clients, ClientsHandle},
-        net::{TcpConnection, TcpConnectionHandle},
+        net::{Authenticated, Handshake, TcpConnection, TcpConnectionHandle},
     },
 };
 
 pub struct Server {
     clients: ClientsHandle,
-    connections: HashMap<ClientId, TcpConnectionHandle>,
+    connections: HashMap<ClientId, TcpConnectionHandle<Authenticated>>,
 }
 
 impl Server {
@@ -60,10 +60,11 @@ impl Server {
     async fn handle_client_login(
         &mut self,
         server_handle_tx: mpsc::Sender<ServerMessage>,
-        conn: TcpConnectionHandle,
+        conn: TcpConnectionHandle<Handshake>,
         login_command: protocol::LoginCommand,
     ) {
         let client = self.clients.register_or_update(login_command).await;
+        let conn = conn.authenticate();
         self.connections.insert(client, conn.clone());
         Self::command_listener_task(server_handle_tx.clone(), conn, client);
     }
@@ -98,7 +99,7 @@ impl Server {
 
     fn login_listener_task(
         server_handle_tx: mpsc::Sender<ServerMessage>,
-        conn: TcpConnectionHandle,
+        conn: TcpConnectionHandle<Handshake>,
     ) {
         tokio::spawn(async move {
             match conn.receive_login().await {
@@ -119,7 +120,7 @@ impl Server {
 
     fn command_listener_task(
         server_handle_tx: mpsc::Sender<ServerMessage>,
-        conn: TcpConnectionHandle,
+        conn: TcpConnectionHandle<Authenticated>,
         client: ClientId,
     ) {
         tokio::spawn(async move {
@@ -179,18 +180,19 @@ impl Server {
         }
 
         for client in stale_clients {
-            self.logout(client);
+            self.logout(client).await;
         }
     }
 
-    fn logout(&mut self, client: ClientId) {
+    async fn logout(&mut self, client: ClientId) {
+        self.clients.remove(client).await;
         self.connections.remove(&client);
     }
 }
 
 enum ServerMessage {
-    NewConnection(TcpConnectionHandle),
-    Login(TcpConnectionHandle, protocol::LoginCommand),
+    NewConnection(TcpConnectionHandle<Handshake>),
+    Login(TcpConnectionHandle<Handshake>, protocol::LoginCommand),
     Logout(ClientId),
     Command(ClientId, ClientCommand),
     Error(anyhow::Error),
