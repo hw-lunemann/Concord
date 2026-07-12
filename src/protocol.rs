@@ -5,6 +5,7 @@ use std::net::TcpStream;
 pub const SERVER_PORT: u16 = 15555;
 pub type User = String;
 pub type PublicKey = String;
+pub type TimestampSecs = u64;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LoginCommand {
@@ -27,7 +28,7 @@ pub enum ClientCommand {
 pub enum ServerCommand {
     // Message vom server zum client
     // timestamp secs, user name, content
-    SendMessage(u64, String, String),
+    SendMessage(TimestampSecs, String, String),
     // Connect new user
     UserConnected(User),
     // Disconnect user
