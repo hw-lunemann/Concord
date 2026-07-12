@@ -47,7 +47,7 @@ impl Server {
                 ServerMessage::Command(sender, command) => {
                     self.handle_client_command(sender, command).await
                 }
-                ServerMessage::Logout(client) => self.logout(client),
+                ServerMessage::Logout(client) => self.logout(client).await,
                 ServerMessage::Error(error) => return Err(error),
             };
         }
@@ -139,10 +139,8 @@ impl Server {
 
     async fn handle_client_command(&mut self, sender: usize, command: ClientCommand) {
         match command {
-            ClientCommand::Logout() => self.logout(sender),
-            ClientCommand::SendMessage(message) => {
-                self.broadcast(sender, message).await;
-            }
+            ClientCommand::Logout() => self.logout(sender).await,
+            ClientCommand::SendMessage(message) => self.broadcast(sender, message).await,
             ClientCommand::StartVoiceCall() => unimplemented!(),
             ClientCommand::StartVideoCall() => unimplemented!(),
         }
