@@ -13,7 +13,7 @@ use crate::{
     protocol::{self, ClientCommand, ServerCommand},
     server::{
         clients::{ClientId, Clients, ClientsHandle},
-        net::{ClientCommandInternal, ServerCommandInternal, TcpConnection, TcpConnectionHandle},
+        net::{TcpConnection, TcpConnectionHandle},
     },
 };
 
@@ -136,20 +136,29 @@ impl Server {
         });
     }
 
-    async fn handle_client_command(&mut self, sender: usize, command: ClientCommandInternal) {
+    async fn handle_client_command(&mut self, sender: usize, command: ClientCommand) {
         match command {
-            ClientCommandInternal::Logout() => self.logout(sender),
-            ClientCommandInternal::SendMessage(message) => {
+            ClientCommand::Logout() => self.logout(sender),
+            ClientCommand::SendMessage(message) => {
                 self.broadcast(sender, message).await;
             }
-            ClientCommandInternal::StartVoiceCall() => unimplemented!(),
-            ClientCommandInternal::StartVideoCall() => unimplemented!(),
+            ClientCommand::StartVoiceCall() => unimplemented!(),
+            ClientCommand::StartVideoCall() => unimplemented!(),
         }
     }
 
-    async fn broadcast(&mut self, sender_id: ClientId, message: Arc<str>) {
-        let sender = self.clients.get_client(sender_id).await.expect("");
-        let sender_name: Arc<str> = sender.user_name.into();
+    async fn broadcast(&mut self, sender_id: ClientId, message: String) {
+        let sender = self
+            .clients
+            .get_client(sender_id)
+            .await
+            .expect(&format!("User with id {sender_id} doesn't exist."));
+
+        let command = Arc::new(ServerCommand::SendMessage(
+            timestamp_secs(),
+            sender.user_name,
+            message,
+        ));
 
         let other_clients = self
             .connections
@@ -159,16 +168,10 @@ impl Server {
         let mut stale_clients = Vec::new();
 
         for (id, conn) in other_clients {
-            let res = conn
-                .send(ServerCommandInternal::SendMessage(
-                    timestamp_secs(),
-                    sender_name.clone(),
-                    message.clone(),
-                ))
-                .await;
+            let res = conn.send(command.clone()).await;
             if let Err(e) = res {
                 println!(
-                    "Send failed on ServerCommand, client will be marked as stale: {:?}",
+                    "Send failed on ServerCommand, client marked as stale: {:?}",
                     e
                 );
                 stale_clients.push(id.clone());
@@ -189,7 +192,7 @@ enum ServerMessage {
     NewConnection(TcpConnectionHandle),
     Login(TcpConnectionHandle, protocol::LoginCommand),
     Logout(ClientId),
-    Command(ClientId, ClientCommandInternal),
+    Command(ClientId, ClientCommand),
     Error(anyhow::Error),
 }
 

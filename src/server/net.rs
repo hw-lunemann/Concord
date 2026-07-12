@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{borrow::Borrow, net::SocketAddr, sync::Arc};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
@@ -16,6 +16,7 @@ pub struct TcpConnection {
 
 impl TcpConnection {
     pub fn init(conn: (TcpStream, SocketAddr)) -> TcpConnectionHandle {
+        println!("New connection from: {}", conn.1);
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             Self {
@@ -32,8 +33,8 @@ impl TcpConnection {
     async fn run(mut self, mut rx: mpsc::Receiver<TcpConnectionMessage>) {
         while let Some(msg) = rx.recv().await {
             match msg {
-                TcpConnectionMessage::Send(command, respond_to) => {
-                    let res = self.send(command).await;
+                TcpConnectionMessage::Send(data, respond_to) => {
+                    let res = self.send(data).await;
                     let _ = respond_to.send(res);
                 }
                 TcpConnectionMessage::Login(respond_to) => {
@@ -41,17 +42,14 @@ impl TcpConnection {
                     let _ = respond_to.send(res);
                 }
                 TcpConnectionMessage::Receive(respond_to) => {
-                    let res = self.receive::<ClientCommandInternal>().await;
+                    let res = self.receive::<ClientCommand>().await.map(|cmd| cmd.into());
                     let _ = respond_to.send(res);
                 }
             }
         }
     }
 
-    async fn send<M: Serialize>(&mut self, message: M) -> std::io::Result<()> {
-        let data = serde_json::to_vec(&message)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
+    async fn send(&mut self, data: Vec<u8>) -> std::io::Result<()> {
         let len = (data.len() as u32).to_be_bytes();
 
         self.stream.write_all(&len).await?;
@@ -83,16 +81,24 @@ pub struct TcpConnectionHandle {
 }
 
 impl TcpConnectionHandle {
-    pub async fn send(&self, command: ServerCommandInternal) -> std::io::Result<()> {
+    pub async fn send<C>(&self, command: C) -> std::io::Result<()>
+    where
+        C: Borrow<ServerCommand>,
+    {
+        let data = serde_json::to_vec(command.borrow())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
         let (respond_to, response) = oneshot::channel();
-        let _ = self
-            .inner
-            .send(TcpConnectionMessage::Send(command, respond_to))
-            .await;
+
+        self.inner
+            .send(TcpConnectionMessage::Send(data, respond_to))
+            .await
+            .expect("TcpConnection task died.");
+
         response.await.expect("TcpConnection task died.")
     }
 
-    pub async fn receive(&self) -> std::io::Result<ClientCommandInternal> {
+    pub async fn receive(&self) -> std::io::Result<ClientCommand> {
         let (respond_to, response) = oneshot::channel();
         let _ = self
             .inner
@@ -112,53 +118,7 @@ impl TcpConnectionHandle {
 }
 
 enum TcpConnectionMessage {
-    Send(ServerCommandInternal, oneshot::Sender<std::io::Result<()>>),
+    Send(Vec<u8>, oneshot::Sender<std::io::Result<()>>),
     Login(oneshot::Sender<std::io::Result<LoginCommand>>),
-    Receive(oneshot::Sender<std::io::Result<ClientCommandInternal>>),
-}
-
-#[derive(Deserialize, Debug)]
-pub enum ClientCommandInternal {
-    // Username, Public Key
-    Logout(),
-    // Message vom client zum server
-    SendMessage(Arc<str>),
-    // TODO
-    StartVoiceCall(),
-    StartVideoCall(),
-}
-
-impl From<ClientCommand> for ClientCommandInternal {
-    fn from(cmd: ClientCommand) -> Self {
-        match cmd {
-            ClientCommand::Logout() => ClientCommandInternal::Logout(),
-            ClientCommand::SendMessage(data) => ClientCommandInternal::SendMessage(data.into()),
-            ClientCommand::StartVoiceCall() => ClientCommandInternal::StartVoiceCall(),
-            ClientCommand::StartVideoCall() => ClientCommandInternal::StartVideoCall(),
-        }
-    }
-}
-
-#[derive(Serialize, Debug)]
-pub enum ServerCommandInternal {
-    // Message vom server zum client
-    SendMessage(u64, Arc<str>, Arc<str>),
-    // Connect new user
-    UserConnected(User),
-    // Disconnect user
-    UserDisconnected(User),
-}
-
-impl From<ServerCommand> for ServerCommandInternal {
-    fn from(cmd: ServerCommand) -> Self {
-        match cmd {
-            ServerCommand::SendMessage(time, msg, name) => {
-                ServerCommandInternal::SendMessage(time, msg.into(), name.into())
-            }
-            ServerCommand::UserConnected(user) => ServerCommandInternal::UserConnected(user.into()),
-            ServerCommand::UserDisconnected(user) => {
-                ServerCommandInternal::UserDisconnected(user.into())
-            }
-        }
-    }
+    Receive(oneshot::Sender<std::io::Result<ClientCommand>>),
 }
