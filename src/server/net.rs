@@ -35,21 +35,37 @@ impl TcpConnection {
 
     async fn run(mut self, mut rx: mpsc::Receiver<TcpConnectionMessage>) {
         while let Some(msg) = rx.recv().await {
-            match msg {
-                TcpConnectionMessage::Send(data, respond_to) => {
-                    let res = self.send(data).await;
-                    let _ = respond_to.send(res);
-                }
-                TcpConnectionMessage::Login(respond_to) => {
-                    let res = self.receive::<LoginCommand>().await;
-                    let _ = respond_to.send(res);
-                }
-                TcpConnectionMessage::Receive(respond_to) => {
-                    let res = self.receive::<ClientCommand>().await.map(|cmd| cmd.into());
-                    let _ = respond_to.send(res);
-                }
+            if let Err(err) = self.handle_messages(msg).await {
+                println!("Connection with {} broken: {}", self.addr, err);
+                return;
             }
         }
+    }
+
+    async fn handle_messages(&mut self, message: TcpConnectionMessage) -> std::io::Result<()> {
+        match message {
+            TcpConnectionMessage::Send(data, respond_to) => {
+                Self::respond_helper(self.send(data).await, respond_to)
+            }
+
+            TcpConnectionMessage::Login(respond_to) => {
+                Self::respond_helper(self.receive::<LoginCommand>().await, respond_to)
+            }
+
+            TcpConnectionMessage::Receive(respond_to) => {
+                Self::respond_helper(self.receive::<ClientCommand>().await, respond_to)
+            }
+        }
+    }
+
+    fn respond_helper<T>(
+        res: std::io::Result<T>,
+        respond_to: oneshot::Sender<std::io::Result<T>>,
+    ) -> std::io::Result<()> {
+        res.map(|data| {
+            let _ = respond_to.send(Ok(data));
+            ()
+        })
     }
 
     async fn send(&mut self, data: Vec<u8>) -> std::io::Result<()> {
