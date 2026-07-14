@@ -1,30 +1,30 @@
 mod clients;
 mod net;
+mod util;
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, sync::Arc};
 
-use tokio::{net::TcpListener, sync::mpsc};
+use anyhow;
+use tokio::sync::mpsc;
 
 use crate::{
     protocol::{self, ClientCommand, ServerCommand},
     server::{
         clients::{ClientId, Clients, ClientsHandle},
-        net::{Authenticated, Handshake, TcpConnection, TcpConnectionHandle},
+        net::{Connection, ConnectionHandle, ConnectionListener, Initializing},
     },
 };
 
+pub type ServerHandle = mpsc::Sender<ServerMessage>;
+
 pub struct Server {
     clients: ClientsHandle,
-    connections: HashMap<ClientId, TcpConnectionHandle<Authenticated>>,
+    connections: HashMap<ClientId, ConnectionHandle>,
 }
 
 impl Server {
     pub fn new() -> Server {
-        Server {
+        Self {
             clients: Clients::init(),
             connections: HashMap::new(),
         }
@@ -33,172 +33,83 @@ impl Server {
     pub async fn run(mut self) -> anyhow::Result<()> {
         let (server_handle_tx, mut server_handle_rx) = mpsc::channel(32);
 
-        Self::connection_listener_task(server_handle_tx.clone());
+        let listener = ConnectionListener::init("127.0.0.1:48584", server_handle_tx).await?;
+        tokio::spawn(listener.run());
 
         while let Some(msg) = server_handle_rx.recv().await {
             match msg {
-                ServerMessage::NewConnection(conn) => {
-                    Self::login_listener_task(server_handle_tx.clone(), conn)
-                }
-                ServerMessage::Login(conn, login_command) => {
-                    self.handle_client_login(server_handle_tx.clone(), conn, login_command)
-                        .await
-                }
+                ServerMessage::Login(conn, login_command) => self.login(conn, login_command).await,
                 ServerMessage::Command(sender, command) => {
                     self.handle_client_command(sender, command).await
                 }
                 ServerMessage::Logout(client) => self.logout(client).await,
-                ServerMessage::Error(error) => return Err(error),
+                ServerMessage::FatalError(error) => return Err(error),
             };
         }
-
-        println!("All server tasks have exited.");
 
         Ok(())
     }
 
-    async fn handle_client_login(
+    async fn login(
         &mut self,
-        server_handle_tx: mpsc::Sender<ServerMessage>,
-        conn: TcpConnectionHandle<Handshake>,
+        conn: Connection<Initializing>,
         login_command: protocol::LoginCommand,
     ) {
         let client = self.clients.register_or_update(login_command).await;
-        let conn = conn.authenticate();
-        self.connections.insert(client, conn.clone());
-        Self::command_listener_task(server_handle_tx.clone(), conn, client);
-    }
-
-    fn connection_listener_task(server_handle_tx: mpsc::Sender<ServerMessage>) {
-        tokio::spawn(async move {
-            let server_handle_tx = server_handle_tx.clone();
-
-            match TcpListener::bind("127.0.0.1:80").await {
-                Ok(listener) => loop {
-                    match listener.accept().await {
-                        Ok(conn) => {
-                            let conn_handle = TcpConnection::init(conn);
-                            let _ = server_handle_tx
-                                .send(ServerMessage::NewConnection(conn_handle))
-                                .await;
-                        }
-                        Err(err) => println!("Failed to accept TCP connection: {}", err),
-                    };
-                },
-                Err(err) => {
-                    let err: anyhow::Error = err.into();
-                    server_handle_tx
-                        .send(ServerMessage::Error(
-                            err.context("Failed to set up the connection listener."),
-                        ))
-                        .await
-                }
-            }
-        });
-    }
-
-    fn login_listener_task(
-        server_handle_tx: mpsc::Sender<ServerMessage>,
-        conn: TcpConnectionHandle<Handshake>,
-    ) {
-        tokio::spawn(async move {
-            match conn.receive_login().await {
-                Ok(login_command) => {
-                    if let Err(err) = server_handle_tx
-                        .send(ServerMessage::Login(conn, login_command))
-                        .await
-                    {
-                        println!("{err:#}");
-                    };
-                }
-                Err(err) => {
-                    println!("{err}");
-                }
-            }
-        });
-    }
-
-    fn command_listener_task(
-        server_handle_tx: mpsc::Sender<ServerMessage>,
-        conn: TcpConnectionHandle<Authenticated>,
-        client: ClientId,
-    ) {
-        tokio::spawn(async move {
-            while let Ok(command) = conn.receive().await {
-                let _ = server_handle_tx
-                    .send(ServerMessage::Command(client, command))
-                    .await;
-            }
-            println!("Receive failed, dropping connection of {client}.");
-            server_handle_tx
-                .send(ServerMessage::Logout(client))
-                .await
-                .expect("Server task has exited.")
-        });
+        let conn = conn.authenticate_as(client);
+        self.connections.insert(client, conn);
     }
 
     async fn handle_client_command(&mut self, sender: usize, command: ClientCommand) {
         match command {
             ClientCommand::Logout() => self.logout(sender).await,
-            ClientCommand::SendMessage(message) => self.broadcast(sender, message).await,
-            ClientCommand::StartVoiceCall() => unimplemented!(),
-            ClientCommand::StartVideoCall() => unimplemented!(),
+            ClientCommand::SendMessage(message) => self.handle_send_message(sender, message).await,
+            _ => unimplemented!(),
         }
     }
 
-    async fn broadcast(&mut self, sender_id: ClientId, message: String) {
-        let sender = self
-            .clients
-            .get_client(sender_id)
-            .await
-            .expect(&format!("User with id {sender_id} doesn't exist."));
+    async fn handle_send_message(&self, sender: ClientId, message: String) {
+        let recipients = self.connections.keys().filter(|&id| id != &sender);
+        self.broadcast(sender, recipients, message).await;
+    }
 
-        let command = Arc::new(ServerCommand::SendMessage(
-            timestamp_secs(),
-            sender.user_name,
-            message,
-        ));
+    async fn broadcast(
+        &self,
+        sender_id: ClientId,
+        recipients: impl IntoIterator<Item = &ClientId>,
+        message: String,
+    ) {
+        let Some(sender) = self.clients.get_client(sender_id).await else {
+            return;
+        };
 
-        let other_clients = self
-            .connections
-            .iter_mut()
-            .filter(|&(other, _)| other != &sender_id);
+        let command: Arc<[u8]> = Arc::from(
+            ServerCommand::SendMessage(util::timestamp_secs(), sender.user_name, message)
+                .serialize(),
+        );
 
-        let mut stale_clients = Vec::new();
-
-        for (id, conn) in other_clients {
-            let res = conn.send(command.clone()).await;
-            if let Err(e) = res {
-                println!(
-                    "Send failed on ServerCommand, client marked as stale: {:?}",
-                    e
-                );
-                stale_clients.push(id.clone());
+        for recipient in recipients {
+            if let Some(connection) = self.connections.get(&recipient) {
+                connection.send(command.clone()).await;
             }
-        }
-
-        for client in stale_clients {
-            self.logout(client).await;
         }
     }
 
     async fn logout(&mut self, client: ClientId) {
-        self.clients.remove(client).await;
         self.connections.remove(&client);
+        self.clients.remove(client).await;
     }
 }
 
-enum ServerMessage {
-    NewConnection(TcpConnectionHandle<Handshake>),
-    Login(TcpConnectionHandle<Handshake>, protocol::LoginCommand),
+pub enum ServerMessage {
+    Login(Connection<Initializing>, protocol::LoginCommand),
     Logout(ClientId),
     Command(ClientId, ClientCommand),
-    Error(anyhow::Error),
+    FatalError(anyhow::Error),
 }
 
-fn timestamp_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("SystemTime::now < UNIX_EPOCH")
-        .as_secs()
+impl ServerCommand {
+    fn serialize(&self) -> Vec<u8> {
+        serde_json::to_vec(&self).expect("ServerCommand: Serialization Bug")
+    }
 }
