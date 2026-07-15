@@ -12,6 +12,7 @@ use crate::{
     server::{
         clients::{ClientId, Clients, ClientsHandle},
         net::{Connection, ConnectionHandle, ConnectionListener, Initializing},
+        util::timestamp_secs,
     },
 };
 
@@ -55,9 +56,13 @@ impl Server {
         conn: Connection<Initializing>,
         login_command: protocol::LoginCommand,
     ) {
+        let user_name = login_command.user_name.clone();
         let client = self.clients.register_or_update(login_command).await;
         let conn = conn.authenticate_as(client);
         self.connections.insert(client, conn);
+        let recipients = self.connections.keys().filter(|&id| id != &client);
+        self.broadcast(recipients, ServerCommand::UserConnected(user_name))
+            .await;
     }
 
     async fn handle_client_command(&mut self, sender: usize, command: ClientCommand) {
@@ -69,24 +74,19 @@ impl Server {
     }
 
     async fn handle_send_message(&self, sender: ClientId, message: String) {
-        let recipients = self.connections.keys().filter(|&id| id != &sender);
-        self.broadcast(sender, recipients, message).await;
+        if let Some(name) = self.clients.get_name(sender).await {
+            let recipients = self.connections.keys().filter(|&id| id != &sender);
+            let message_command = ServerCommand::SendMessage(timestamp_secs(), name, message);
+            self.broadcast(recipients, message_command).await;
+        }
     }
 
     async fn broadcast(
         &self,
-        sender_id: ClientId,
         recipients: impl IntoIterator<Item = &ClientId>,
-        message: String,
+        command: ServerCommand,
     ) {
-        let Some(sender) = self.clients.get_client(sender_id).await else {
-            return;
-        };
-
-        let command: Arc<[u8]> = Arc::from(
-            ServerCommand::SendMessage(util::timestamp_secs(), sender.user_name, message)
-                .serialize(),
-        );
+        let command: Arc<[u8]> = Arc::from(command.serialize());
 
         for recipient in recipients {
             if let Some(connection) = self.connections.get(&recipient) {
@@ -97,6 +97,12 @@ impl Server {
 
     async fn logout(&mut self, client: ClientId) {
         self.connections.remove(&client);
+        if let Some(sender_name) = self.clients.get_name(client).await {
+            let recipients = self.connections.keys().filter(|&id| id != &client);
+            self.broadcast(recipients, ServerCommand::UserDisconnected(sender_name))
+                .await;
+        };
+
         self.clients.remove(client).await;
     }
 }
