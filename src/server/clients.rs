@@ -35,8 +35,8 @@ impl Clients {
                 let id = self.register_or_update(login_data);
                 let _ = respond_to.send(id);
             }
-            ClientsMessage::Remove(client) => {
-                self.remove(client);
+            ClientsMessage::Remove(id) => {
+                self.remove(id);
             }
             ClientsMessage::GetClient(id, respond_to) => {
                 let user_name = self.user_name[id].clone();
@@ -49,6 +49,9 @@ impl Clients {
                     _ => None,
                 };
                 let _ = respond_to.send(response);
+            }
+            ClientsMessage::GetName(id, respond_to) => {
+                let _ = respond_to.send(self.user_name[id].clone());
             }
         }
     }
@@ -93,7 +96,7 @@ impl ClientsHandle {
             .await
             .expect("Clients task has died.");
 
-        response.await.expect("Client task has died.")
+        response.await.expect("Clients task has died.")
     }
 
     pub async fn remove(&self, id: ClientId) {
@@ -110,7 +113,17 @@ impl ClientsHandle {
             .await
             .expect("Clients task has died.");
 
-        response.await.expect("Client task has died.")
+        response.await.expect("Clients task has died.")
+    }
+
+    pub async fn get_name(&self, id: ClientId) -> Option<String> {
+        let (respond_to, response) = oneshot::channel();
+        self.inner
+            .send(ClientsMessage::GetName(id, respond_to))
+            .await
+            .expect("Clients task has died.");
+
+        response.await.expect("Clients task has died.")
     }
 }
 
@@ -118,6 +131,7 @@ pub enum ClientsMessage {
     AddOrUpdate(protocol::LoginCommand, oneshot::Sender<ClientId>),
     Remove(ClientId),
     GetClient(ClientId, oneshot::Sender<Option<Client>>),
+    GetName(ClientId, oneshot::Sender<Option<String>>),
 }
 
 pub struct Client {
